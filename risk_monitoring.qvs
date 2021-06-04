@@ -1,0 +1,299 @@
+SET ThousandSep=',';
+SET DecimalSep='.';
+SET MoneyThousandSep=',';
+SET MoneyDecimalSep='.';
+SET MoneyFormat='$#,##0.00;-$#,##0.00';
+SET TimeFormat='h:mm:ss TT';
+SET DateFormat='M/D/YYYY';
+SET TimestampFormat='M/D/YYYY h:mm:ss[.fff] TT';
+SET FirstWeekDay=6;
+SET BrokenWeeks=1;
+SET ReferenceDay=0;
+SET FirstMonthOfYear=1;
+SET CollationLocale='en-US';
+SET CreateSearchIndexOnReload=1;
+SET MonthNames='Jan;Feb;Mar;Apr;May;Jun;Jul;Aug;Sep;Oct;Nov;Dec';
+SET LongMonthNames='January;February;March;April;May;June;July;August;September;October;November;December';
+SET DayNames='Mon;Tue;Wed;Thu;Fri;Sat;Sun';
+SET LongDayNames='Monday;Tuesday;Wednesday;Thursday;Friday;Saturday;Sunday';
+SET NumericalAbbreviation='3:k;6:M;9:G;12:T;15:P;18:E;21:Z;24:Y;-3:m;-6:μ;-9:n;-12:p;-15:f;-18:a;-21:z;-24:y';
+
+
+/************************************ main *************************************************************/
+
+DPD:
+load * Inline [
+DPD_Type, Value
+1+, 1
+30+,2
+60+,3
+90+,4
+];
+
+Ordered_list:
+mapping load * inline [
+DPD_bucket,NumValue
+Pending,1
+0,2
+1-5,3
+6-15,4
+16-30,5
+30+,6];
+
+/************************************ main *************************************************************/
+
+// Repayments data from KSF layer.
+
+Repayment_data:
+LOAD product_code,
+	if (product_code='ZCL', 'Zest Money', if(product_code = 'CFB', 'Capital Float',
+    if(product_code = 'MTL','MoneyTap',
+    if(product_code='ESL','Early Salary',
+    if(product_code='PSE','Paysense'))))) as Partner_Name,
+    sum(interest_paid_amt) as interest_paid_amt,
+    sum(paid_amt) as paid_amt,
+    sum(principal_paid_amt) as principal_paid_amt
+FROM [lib://Volume_data_folder/lannister_repayment.qvd]
+(qvd)
+where status<=50 and status>=40 and customer_debit_date<= '$(vprevious_monthend)'
+group by product_code;
+
+collection_alert_temp:
+LOAD
+    sender_name,
+    if (match(sender_name,'CAMDEN TOWN TECHNOLOGIES PVT LTD RE','CAMDEN TOWN TECH PL', 'ZEST MONEY', 'NODAL CAMDEN TOWN TECHNOLOGIES PVT')>0, 'Zest Money',
+    if(match(sender_name,'CAPITAL FLOAT', 'CS CAPITAL FLOAT ESCROW')>0, 'Capital Float',
+    if(match(sender_name,'MONEYTAP')>0,'MoneyTap',
+    if(match(sender_name,'EARLY SALARY')>0,'Early Salary'
+    ,If(Match(sender_name,'Paysense Nodal','Paysense Escrow','PAYSENSE SERVICES INDIA PVT LTD')>0,'Paysense'
+    , if(Match(utr_number,'KKBK202059257030')>0,'Zest Money')))))) as Partner_Name,
+    amount as KSF_recieved_amt
+FROM [lib://PFI_data_folder/lannister_collection_alert.qvd]
+(qvd)
+where credit_date <='$(vprevious_monthend)';
+
+collection_alert:
+LOAD
+    Partner_Name,
+    sum(KSF_recieved_amt) as KSF_recieved_amt
+Resident collection_alert_temp
+group by Partner_Name;
+
+Drop Table collection_alert_temp;
+
+/***************************** Partner DPD data******************************************/
+
+Unqualify *;
+
+[Qlik Feeder Temp]:
+// loading partner data from automated aggregated report.
+LOAD
+    Loan_ID,
+    (num(Year (Monthstart(due_date_year_month)))-2000)*12+
+    num(Month (Monthstart(due_date_year_month))) -(num(Year (Monthstart("Loan Start Date")))-2000)*12 -   num(Month (Monthstart("Loan Start Date"))) as MOB,
+    "Loan Start Date",
+    Loan_amount,
+    "Interest Capitalized",
+    due_date,
+    due_date_year_month,
+    "Principal OS",
+    emi_number,
+    "Sum of expected_principle",
+    "Sum of expected_interest",
+    "Sum of emi_amount",
+    Moratorium,
+    "Interest Paid",
+    "Principal Paid",
+    "Repayment applied",
+    "Value Date",
+    Partner_Name,
+    "0-30 PD",
+    "30-60 PD",
+    "60-90 PD",
+    "90-120 PD",
+    "120-150 PD",
+    "150-180 PD",
+    "180+ PD",
+    DPD,
+    DPD_category,
+    "cummulative Interest expected",
+    "cummulative Interest paid",
+    "cummulative principal expected",
+    cummulative_principal_paid,
+    is_morat_account,
+    settlement_status,
+    days_past_due,
+    Restructured_date,
+    Child_restructured,
+    pos_paid,
+    product_type
+FROM [lib://PFI_data_folder/T1_Aggregated_DPD_report.qvd]
+(qvd)
+WHERE due_date_year_month<='$(vnext_monthend)';
+
+
+
+NoConcatenate
+
+[Qlik Feeder 1]:
+LOAD *,
+if(settlement_status='Pending','Pending', If(days_past_due<=0,'0',If(days_past_due<=5,'1-5',if(days_past_due<=15,'6-15',if(days_past_due<=30,'16-30','30+'))))) as DPD_bucket,
+if(settlement_status='Pending','Pending', If(day([Value Date])<=5,'before 5th',If(day([Value Date])<=10,'before 10th',if(day([Value Date])<=15,'before 15th',if(day([Value Date])<=20,'beofre 20th','after 20th'))))) as DPD_bucket_date,
+if([0-30 PD]>0,pos_paid,0) as [0-30 PO],
+if([30-60 PD]>0,pos_paid,0) as [30-60 PO],
+if([60-90 PD]>0,pos_paid,0) as [60-90 PO],
+if([90-120 PD]>0,pos_paid,0) as [90-120 PO],
+if([120-150 PD]>0,pos_paid,0) as [120-150 PO],
+if([150-180 PD]>0,pos_paid,0) as [150-180 PO],
+if([180+ PD]>0,pos_paid,0) as [180+ PO],
+[Moratorium] as [Moratorium_New],
+if(Restructured_date<MonthEnd(due_date_year_month),1,0) as restructured_flag
+Resident [Qlik Feeder Temp]
+WHERE due_date_year_month <= '$(vprevious_monthend)';;
+
+NoConcatenate
+
+[Qlik Feeder 2]:
+LOAD *,
+dual(DPD_bucket,ApplyMap('Ordered_list',DPD_bucket,7)) as DPD_bucket_new
+Resident [Qlik Feeder 1]
+order by [Partner_Name]asc,[Loan_ID] asc,[emi_number] asc,[due_date] asc ;
+
+Drop field DPD_bucket,[Principal OS],Moratorium;
+
+NoConcatenate
+
+[Qlik Feeder]:
+Load*,
+if( (if (emi_number=0, [cummulative Interest expected], Previous([cummulative Interest expected]))
++ if (emi_number=0, [cummulative principal expected], Previous([cummulative principal expected]))
+- if (emi_number=0, [cummulative_principal_paid], Previous([cummulative_principal_paid]))
+- if (emi_number=0, [cummulative Interest paid], Previous([cummulative Interest paid])))>10,(if (emi_number=0, [cummulative Interest expected], Previous([cummulative Interest expected]))
++ if (emi_number=0, [cummulative principal expected], Previous([cummulative principal expected]))
+- if (emi_number=0, [cummulative_principal_paid], Previous([cummulative_principal_paid]))
+- if (emi_number=0, [cummulative Interest paid], Previous([cummulative Interest paid]))),0)
+as previous_overdue
+Resident
+[Qlik Feeder 2];
+
+DROP table [Qlik Feeder Temp],[Qlik Feeder 1], [Qlik Feeder 2];
+
+/***************************************** KSF LOS ********************************************************/
+
+// Loan attributes from KSF layer.
+Left Join ([Qlik Feeder])
+spiderman_loan:
+LOAD
+    partner_loan_id as [Loan_ID],
+    loan_id as KSF_loan_id,
+    app_form_id,
+    loan_int_rate,
+    loan_product,
+    loan_repay_method,
+    tenure,
+    mandate_source,
+    merchant,
+    partner_score,
+    if(partner_score>=0 and partner_score<=20,Dual('<=20',1),
+    	 if(partner_score>20 and partner_score<=350,Dual('20 to 350',2),
+         	if(partner_score>350 and partner_score<=500,Dual('350 to 500',3),
+            	if(partner_score>500 and partner_score<=650,Dual('500 to 650',4),
+                	if(partner_score>650 and partner_score<=800,Dual('650 to 800',5), Dual('800-1000',6)))))) as [Partner Score bucket],
+    number_of_co_borrowers,
+    emi_type,
+    partner_id,
+    [Loan amount bucket],
+    if(loan_int_rate>=0 and loan_int_rate<=12,Dual('0 to 12',1),
+    	 if(loan_int_rate>12 and loan_int_rate<=18,Dual('12 to 18',2),
+         	if(loan_int_rate>18 and loan_int_rate<=24,Dual('18 to 24',3),
+            	if(loan_int_rate>24 and loan_int_rate<=30,Dual('24 to 30',4),
+                	if(loan_int_rate>30 and loan_int_rate<=36,Dual('30 to 36',5), Dual('>36',6)))))) as [Interest Rate bucket],
+    if(tenure>=0 and tenure<=12,Dual('0 to 12',1),
+    	 if(tenure>12 and tenure<=18,Dual('12 to 18',2),
+         	if(tenure>18 and tenure<=24,Dual('18 to 24',3),
+            	if(tenure>24 and tenure<=30,Dual('24 to 30',4),
+                	if(tenure>30 and tenure<=36,Dual('30 to 36',5), Dual('>36',6)))))) as [Tenure bucket]
+FROM [lib://Volume_data_folder/T1_spiderman_loan.qvd]
+(qvd);
+
+left join
+bureau_data:
+LOAD
+    app_form_id,
+    bureau_name,
+    "type" as score_type,
+    credit_rating,
+    if(credit_rating>=0 and credit_rating<=11,Dual('NTC',1),
+    	 if(credit_rating>11 and credit_rating<=350,Dual('11 to 350',2),
+         	if(credit_rating>350 and credit_rating<=500,Dual('350 to 500',3),
+            	if(credit_rating>500 and credit_rating<=650,Dual('500 to 650',4),
+                	if(credit_rating>650 and credit_rating<=800,Dual('650 to 800',5), Dual('800-900',6)))))) as [credit_rating bucket]
+FROM [lib://PFI_data_folder/T1_cerebro_bureau_score.qvd]
+(qvd);
+
+left join
+Customer:
+LOAD
+    app_form_id ,//as cust_App_form_ID,,
+    applicant_id as %KEY_TO_Customer
+FROM [lib://PII_data_folder/T1_asgard_customer.qvd]
+(qvd);
+LEFT Join
+
+individual:
+LOAD
+    applicant_id as %KEY_TO_Customer,
+    Age,
+    if(Age>=0 and Age<=18,Dual('<=18',1),
+    	 if(Age>18 and Age<=24,Dual('18 to 24',2),
+         	if(Age>24 and Age<=35,Dual('24 to 35',3),
+            	if(Age>35 and Age<=50,Dual('35 to 50',4),
+                	if(Age>50 and Age<=65,Dual('50 to 65',5), Dual('>65',6)))))) as [Age bucket],
+    employment_type,
+    gender,
+    industry,
+    marital_status,
+    employer
+from [lib://PII_data_folder/T1_shield_individual.qvd](qvd);
+
+left join
+
+Address:
+LOAD
+    city,
+    country,
+    StateName,
+    "type" as [Address type],
+    applicant_id as %KEY_TO_Customer
+FROM [lib://PII_data_folder/T1_shield_address.qvd]
+(qvd);
+
+/************************************************* Calendar ***********************************************/
+
+// Calendar to format date variables.
+[autoCalendar]:
+  DECLARE FIELD DEFINITION Tagged ('$date')
+FIELDS
+  Dual(Year($1), YearStart($1)) AS [Year] Tagged ('$axis', '$year'),
+  Dual('Q'&Num(Ceil(Num(Month($1))/3)),Num(Ceil(NUM(Month($1))/3),00)) AS [Quarter] Tagged ('$quarter', '$cyclic'),
+  Dual(Year($1)&'-Q'&Num(Ceil(Num(Month($1))/3)),QuarterStart($1)) AS [YearQuarter] Tagged ('$yearquarter', '$qualified'),
+  Dual('Q'&Num(Ceil(Num(Month($1))/3)),QuarterStart($1)) AS [_YearQuarter] Tagged ('$yearquarter', '$hidden', '$simplified'),
+  Month($1) AS [Month] Tagged ('$month', '$cyclic'),
+  Dual(Year($1)&'-'&Month($1), monthstart($1)) AS [YearMonth] Tagged ('$axis', '$yearmonth', '$qualified'),
+  Dual(Month($1), monthstart($1)) AS [_YearMonth] Tagged ('$axis', '$yearmonth', '$simplified', '$hidden'),
+  Dual('W'&Num(Week($1),00), Num(Week($1),00)) AS [Week] Tagged ('$weeknumber', '$cyclic'),
+  Date(Floor($1)) AS [Date] Tagged ('$axis', '$date', '$qualified'),
+  Date(Floor($1), 'D') AS [_Date] Tagged ('$axis', '$date', '$hidden', '$simplified'),
+  If (DayNumberOfYear($1) <= DayNumberOfYear(Today()), 1, 0) AS [InYTD] ,
+  Year(Today())-Year($1) AS [YearsAgo] ,
+  If (DayNumberOfQuarter($1) <= DayNumberOfQuarter(Today()),1,0) AS [InQTD] ,
+  4*Year(Today())+Ceil(Month(Today())/3)-4*Year($1)-Ceil(Month($1)/3) AS [QuartersAgo] ,
+  Ceil(Month(Today())/3)-Ceil(Month($1)/3) AS [QuarterRelNo] ,
+  If(Day($1)<=Day(Today()),1,0) AS [InMTD] ,
+  12*Year(Today())+Month(Today())-12*Year($1)-Month($1) AS [MonthsAgo] ,
+  Month(Today())-Month($1) AS [MonthRelNo] ,
+  If(WeekDay($1)<=WeekDay(Today()),1,0) AS [InWTD] ,
+  (WeekStart(Today())-WeekStart($1))/7 AS [WeeksAgo] ,
+  Week(Today())-Week($1) AS [WeekRelNo] ;
+
+DERIVE FIELDS FROM FIELDS [Loan Start Date],[due_date], [due_date_year_month], [Value Date] ,[Restructured_date] USING [autoCalendar] ;
